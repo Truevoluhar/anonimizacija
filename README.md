@@ -30,10 +30,12 @@ Okoljske spremenljivke v `.env` se v lokalnem Python zagonu ne naložijo samodej
 2. Storitev hrani `guid` samo na strežniku, lokalno v SQLite. Brskalnik dobi naključno HttpOnly/SameSite cookie. Pri vsakem zasebnem klicu agentu storitev doda query parameter `guid`, kot zahteva njegov API.
 3. Datoteka gre v `POST workspace-api/v1/files` z ločeno mapo za vsako opravilo.
 4. `POST agent-api/v1/threads` ustvari thread, nato `POST /v1/threads/{thread_id}/runs` zažene anonimizacijo v ozadju. Zahtevani JSON odgovor vsebuje `status`, `output_path`, `summary`.
-5. GUI na 2,5 sekunde preverja stanje. Backend uporablja `GET /v1/runs/{run_id}` in ob zaključku `GET /v1/threads/{thread_id}/messages`. Dovoljen rezultat je samo točno vnaprej določena izhodna pot tega opravila.
+5. GUI na 2,5 sekunde preverja stanje. Backend uporablja `GET /v1/runs/{run_id}` in ob zaključku `GET /v1/threads/{thread_id}/messages`. Storitev razbere JSON (tudi besedilne bloke in Markdown ograje) ter preveri dosegljivost PDF-ja prek workspace-api. Sprejme vnaprej določeno pot ali drugo PDF-pot pod `/exports`, katere ime vsebuje UUID istega opravila. Tuje oziroma nedoločljive poti zavrne.
 6. Prenos teče prek `GET workspace-api/v1/files/{path}` in tega webservisa; `guid` se ne razkrije brskalniku.
 
 Vsak račun vidi samo svoja opravila in prenose. Zgodovina ter povezave do agentovih opravil so v trajnem Docker volumnu `service_data`. Ob obnovitvi strani se status nadaljuje; ob ponovnem zagonu tega webservisa se spremljanje že potrjenih agentovih opravil nadaljuje. Ponovni zagon agent-api prekine njegove opravke v pomnilniku: storitev tedaj pokaže napako. Če potrditev zagona ne prispe, storitev ohrani stanje »preverjam povezavo« ter prek aktivnega opravila in shranjenih sporočil istega threada obnovi spremljanje ali rezultat. Zahteve za anonimizacijo ne pošlje ponovno. Samo nalaganja, prekinjena pred ustvarjanjem threada, se označijo kot neuspešna. Storitev uporablja en uvicorn worker.
+
+Če odgovor ne potrjuje uspešne anonimizacije, PDF na poti tega opravila pa je dosegljiv, je rezultat `review_required`: GUI izrecno opozori, da anonimizacija ni potrjena, in omogoči prenos samo za ročni pregled. Tak prenos ima ime `_nepotrjeno_pregled.pdf`. Preverjanje `%PDF-` glave potrdi dosegljivost PDF vsebine, ne popolnosti datoteke ali uspešnosti prekrivanja. Manjkajoč/neustrezen PDF ostane napaka. Po posodobitvi se stare napake »Agent ne potrjuje izdelave anonimiziranega dokumenta.« ponovno preverijo brez novega zagona anonimizacije.
 
 Rezultat je vedno kopija za človeški pregled, ne potrdilo popolne anonimizacije. Izvirni dokumenti in rezultati ostanejo v uporabnikovem workspaceu pri agentu. Odjava izbriše samo relacijo te storitve, zato ne prekine drugih agentovih odjemalcev.
 
@@ -52,3 +54,10 @@ python -m unittest discover -s tests -v
 ```
 
 Integracijski testi uporabljajo simulirana API-ja in preverijo prijavo, tok datoteka → thread → run → rezultat, prenos, ločitev uporabnikov, izvor zahtev ter zavračanje napačnih datotek. Ne kličejo modela.
+
+
+## Diagnostika rezultata in healthchecka
+
+Logi vsebujejo `result_received`, `artifact_probe`, `result_needs_review`, `result_rejected` ter `upstream_transport_error`/`upstream_http_error`. Navedejo ID opravila, razlog in vrsto napake oziroma status, ne prijavnih GUID, odgovorov agenta ali vsebine dokumentov. To loči napačno obliko odgovora, napačno pot, manjkajoč PDF in omrežno napako.
+
+`unhealthy` izvira iz ločenega healthchecka lokalnega `/health`. Sam po sebi ne pomeni, da je agentova anonimizacija odpovedala. Compose uporablja interval 20 s, timeout 20 s in zagonsko obdobje 45 s; s tem počasen zagon Python preverjanja ne odpove že po 5 s. Dejanski razlog neuspelega preverjanja preverite v healthcheck zgodovini Dockerja/Podmana. Pri namestitvi ohranite svoje porte, naslove API-jev in omrežne nastavitve.

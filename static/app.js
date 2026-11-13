@@ -20,13 +20,13 @@ function render() {
     const title=document.createElement('h3'); title.textContent=job.filename;
     const status=document.createElement('div');status.className='status';
     const dot=document.createElement('span');dot.className='dot';status.append(dot);
-    const labels={queued:'Pripravljam opravilo …',starting:'Nalaganje dokumenta in priprava agenta …',submitting:'Pošiljam opravilo agentu …',recovering:'Preverjam povezavo in stanje pri agentu …',running:'Agent izvaja anonimizacijo …',completed:'Kopija je pripravljena za pregled',failed:'Opravila ni bilo mogoče dokončati'};
+    const labels={queued:'Pripravljam opravilo …',starting:'Nalaganje dokumenta in priprava agenta …',submitting:'Pošiljam opravilo agentu …',recovering:'Preverjam povezavo in stanje pri agentu …',running:'Agent izvaja anonimizacijo …',completed:'Kopija je pripravljena za pregled',review_required:'PDF je ustvarjen; anonimizacija ni potrjena',failed:'Opravila ni bilo mogoče dokončati'};
     status.append(document.createTextNode(job.phase||labels[job.status]||'Preverjam stanje …'));
     const meta=document.createElement('div');meta.className='meta';
     const elapsed=Math.max(0,Math.floor(Date.now()/1000-job.created));
     meta.textContent=job.status==='recovering'?`Od oddaje ${Math.floor(elapsed/60)} min ${elapsed%60} s · preverjam dejansko stanje`:active(job.status)?`V teku ${Math.floor(elapsed/60)} min ${elapsed%60} s · stanje se osvežuje`:job.summary;
     el.append(title,status,meta);
-    if(job.status==='completed'){const link=document.createElement('a');link.className='download';link.href=`/api/jobs/${encodeURIComponent(job.id)}/download`;link.textContent='Prenesi PDF za pregled ↓';el.append(link);}
+    if(['completed','review_required'].includes(job.status)){const link=document.createElement('a');link.className='download';link.href=`/api/jobs/${encodeURIComponent(job.id)}/download`;link.textContent=job.status==='review_required'?'Prenesi nepotrjeni PDF za ročni pregled ↓':'Prenesi PDF za pregled ↓';el.append(link);}
     return el;
   }));
   $('#start').disabled=busy||jobs.some(j=>active(j.status));

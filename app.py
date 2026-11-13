@@ -2,10 +2,11 @@
 from contextlib import asynccontextmanager
 from datetime import datetime
 from hashlib import sha256
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from urllib.parse import urlsplit, quote
 import asyncio
 import json
+import logging
 import os
 import secrets
 import sqlite3
@@ -25,6 +26,7 @@ DB = DATA / 'anonymizer.sqlite3'
 COOKIE = 'anonymizer_session'
 LIMIT = int(os.getenv('MAX_UPLOAD_MB', '40')) * 1024 * 1024
 TASKS = set()
+LOGGER = logging.getLogger("uvicorn.error")
 SCHEMA = {
     'type': 'object', 'properties': {
         'status': {'type': 'string', 'enum': ['review_required', 'failed']},
@@ -51,7 +53,8 @@ def initialize():
             run_id TEXT, output_path TEXT NOT NULL, summary TEXT NOT NULL DEFAULT '');
         UPDATE jobs SET status='recovering', summary='Preverjam stanje že poslanega opravila pri agentu.'
             WHERE thread_id IS NOT NULL AND (status IN ('queued','starting','submitting')
-            OR (status='failed' AND summary='Povezava z agentom trenutno ni na voljo. Poskusite znova.'));
+            OR (status='failed' AND summary IN ('Povezava z agentom trenutno ni na voljo. Poskusite znova.',
+            'Agent ne potrjuje izdelave anonimiziranega dokumenta.')));
         UPDATE jobs SET status='failed', summary='Nalaganje je bilo prekinjeno pred ustvarjanjem pogovora. Dokument naložite ponovno.'
             WHERE thread_id IS NULL AND status IN ('queued','starting');
         ''')
@@ -105,9 +108,13 @@ async def upstream(request, method, base, path, guid=None, **kwargs):
     params = {'guid': guid} if guid else {}
     try:
         response = await request.app.state.http.request(method, base + path, params=params, **kwargs)
-    except httpx.RequestError:
+    except httpx.RequestError as exc:
+        LOGGER.warning('upstream_transport_error service=%s method=%s path=%s error_type=%s',
+                       'agent' if base == AGENT else 'workspace', method, path, type(exc).__name__)
         raise HTTPException(503, 'Povezava z agentom trenutno ni na voljo. Poskusite znova.') from None
     if response.status_code >= 400:
+        LOGGER.warning('upstream_http_error service=%s method=%s path=%s status=%s',
+                       'agent' if base == AGENT else 'workspace', method, path, response.status_code)
         messages = {404: 'Opravilo ali datoteka pri agentu ne obstaja več.', 401: 'Prijava ni veljavna ali je potekla.', 403: 'Dostop ni dovoljen.',
                     409: 'Agent za ta račun že izvaja opravilo. Počakajte na zaključek.',
                     413: 'Dokument presega dovoljeno velikost.'}
@@ -248,21 +255,109 @@ async def list_jobs(request: Request):
     return [dict(row) for row in rows]
 
 
-async def synchronize_result(request, user, job):
+def parse_agent_result(answer):
+    """Accept text blocks/fences produced by model providers, without guessing fields."""
+    if isinstance(answer, list):
+        answer = ''.join(block.get('text', '') for block in answer
+                         if isinstance(block, dict) and isinstance(block.get('text'), str))
+    for _ in range(2):
+        if isinstance(answer, dict):
+            return answer
+        if not isinstance(answer, str):
+            return {}
+        text = answer.strip()
+        if text.startswith('```') and text.endswith('```'):
+            lines = text.splitlines()
+            text = '\n'.join(lines[1:-1])
+        try:
+            answer = json.loads(text)
+        except (ValueError, TypeError):
+            return {}
+    return answer if isinstance(answer, dict) else {}
+
+
+def result_path(raw, job):
+    """Only accept exports belonging to this job, never arbitrary agent file paths."""
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    value = raw.strip()
+    if '\\' in value or '..' in PurePosixPath(value).parts:
+        return None
+    path = PurePosixPath('/' + value.lstrip('/'))
+    normalized = str(path)
+    if normalized == job['output_path']:
+        return normalized
+    if (path.parts[:2] == ('/', 'exports') and path.suffix.lower() == '.pdf'
+            and job['id'] in path.name):
+        return normalized
+    return None
+
+
+async def artifact_available(request, user, job, path):
+    """Probe the scoped export, not a list of possibly unrelated workspace files."""
+    url = WORKSPACE + '/v1/files/' + quote(path.lstrip('/'), safe='/')
+    req = request.app.state.http.build_request('GET', url, params={'guid': user['guid']},
+                                              headers={'Range': 'bytes=0-4'})
+    try:
+        response = await request.app.state.http.send(req, stream=True)
+    except httpx.RequestError as exc:
+        LOGGER.warning('artifact_probe_transport_error job=%s error_type=%s', job['id'], type(exc).__name__)
+        raise HTTPException(503, 'Preverjanje ustvarjene datoteke trenutno ni mogoče.') from None
+    try:
+        if response.status_code == 404:
+            return False
+        if response.status_code in (401, 403):
+            raise HTTPException(response.status_code, 'Dostop do rezultata ni dovoljen ali je prijava potekla.')
+        if response.status_code not in (200, 206):
+            LOGGER.warning('artifact_probe_http_error job=%s status=%s', job['id'], response.status_code)
+            raise HTTPException(502, 'Preverjanje ustvarjene datoteke trenutno ni mogoče.')
+        header = b''
+        async for chunk in response.aiter_bytes():
+            header += chunk[:5-len(header)]
+            if len(header) >= 5:
+                break
+        available = header == b'%PDF-'
+        LOGGER.info('artifact_probe job=%s pdf_header=%s', job['id'], available)
+        return available
+    except httpx.RequestError as exc:
+        LOGGER.warning('artifact_probe_transport_error job=%s error_type=%s', job['id'], type(exc).__name__)
+        raise HTTPException(503, 'Preverjanje ustvarjene datoteke trenutno ni mogoče.') from None
+    finally:
+        await response.aclose()
+
+
+async def synchronize_result(request, user, job, completed=False):
     messages = (await upstream(request, 'GET', AGENT,
                 '/v1/threads/' + job['thread_id'] + '/messages', user['guid'])).json()
     answer = next((m['content'] for m in reversed(messages) if m['role'] == 'assistant'), None)
-    if answer is None:
+    if answer is None and not completed:
         return False
-    try:
-        result = json.loads(answer)
-    except (ValueError, TypeError):
-        result = {}
-    if not isinstance(result, dict):
-        result = {}
-    valid = result.get('status') == 'review_required' and result.get('output_path') == job['output_path']
-    update(job['id'], status='completed' if valid else 'failed',
-           summary=str(result.get('summary') or 'Agent ne potrjuje izdelave anonimiziranega dokumenta.'))
+    result = parse_agent_result(answer)
+    declared_path = result.get('output_path')
+    candidate = result_path(declared_path, job)
+    if declared_path and candidate is None:
+        LOGGER.warning('result_rejected job=%s reason=unscoped_output_path', job['id'])
+        update(job['id'], status='failed', summary='Agent je vrnil pot, ki ne pripada temu opravilu; prenos ni dovoljen.')
+        return True
+    candidate = candidate or job['output_path']
+    confirmed = result.get('status') == 'review_required' and result_path(declared_path, job) is not None
+    LOGGER.info('result_received job=%s json_object=%s confirmed=%s path_matches=%s',
+                job['id'], bool(result), confirmed, declared_path == job['output_path'])
+    if not await artifact_available(request, user, job, candidate):
+        LOGGER.warning('result_rejected job=%s reason=missing_or_non_pdf_export', job['id'])
+        update(job['id'], status='failed', summary='Agentovo opravilo je zaključeno, vendar izhodni PDF ni dosegljiv na poti tega opravila.')
+        return True
+    summary = result.get('summary')
+    summary = summary if isinstance(summary, str) else ''
+    if confirmed:
+        update(job['id'], status='completed', output_path=candidate,
+               summary=summary or 'Dokument je ustvarjen. Pred uporabo ročno preverite vse strani.')
+    else:
+        warning = ('PDF je ustvarjen, vendar agentov odgovor ne potrjuje uspešne anonimizacije. '
+                   'Prenos je namenjen samo ročnemu pregledu; dokumenta ne obravnavajte kot preverjeno anonimiziranega.')
+        update(job['id'], status='review_required', output_path=candidate,
+               summary=warning + (' Agentovo pojasnilo: ' + summary if summary else ''))
+        LOGGER.warning('result_needs_review job=%s reason=agent_confirmation_missing', job['id'])
     return True
 
 
@@ -285,7 +380,7 @@ async def job_status(job_id: str, request: Request):
             state = (await upstream(request, 'GET', AGENT, '/v1/runs/' + job['run_id'], user['guid'])).json()
             phase = state.get('phase', '')
             if state['status'] == 'completed':
-                await synchronize_result(request, user, job)
+                await synchronize_result(request, user, job, completed=True)
             elif state['status'] in {'failed', 'cancelled'}:
                 update(job_id, status='failed', summary=state.get('error') or 'Agent je opravilo prekinil.')
     except HTTPException as exc:
@@ -309,7 +404,7 @@ async def job_status(job_id: str, request: Request):
 async def download(job_id: str, request: Request):
     user = session(request)
     job = owned_job(job_id, user)
-    if job['status'] != 'completed':
+    if job['status'] not in ('completed', 'review_required'):
         raise HTTPException(409, 'Rezultat še ni pripravljen.')
     path = '/v1/files/' + quote(job['output_path'].lstrip('/'), safe='/')
     req = request.app.state.http.build_request('GET', WORKSPACE + path, params={'guid': user['guid']})
@@ -326,6 +421,7 @@ async def download(job_id: str, request: Request):
                 yield chunk
         finally:
             await response.aclose()
-    name = Path(job['filename']).stem + '_anonimizirano_pregled.pdf'
+    suffix = '_nepotrjeno_pregled.pdf' if job['status'] == 'review_required' else '_anonimizirano_pregled.pdf'
+    name = Path(job['filename']).stem + suffix
     return StreamingResponse(chunks(), media_type='application/pdf', headers={
         'Content-Disposition': "attachment; filename*=UTF-8''" + quote(name)})
