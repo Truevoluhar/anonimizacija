@@ -1,4 +1,8 @@
 """Independent document anonymization UI; talks exclusively to published agent APIs."""
+from ArmUtils.environment import load_environment
+
+load_environment("anonymizer_service")
+
 from contextlib import asynccontextmanager
 from datetime import datetime
 from hashlib import sha256

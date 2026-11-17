@@ -61,3 +61,41 @@ Integracijski testi uporabljajo simulirana API-ja in preverijo prijavo, tok dato
 Logi vsebujejo `result_received`, `artifact_probe`, `result_needs_review`, `result_rejected` ter `upstream_transport_error`/`upstream_http_error`. Navedejo ID opravila, razlog in vrsto napake oziroma status, ne prijavnih GUID, odgovorov agenta ali vsebine dokumentov. To loči napačno obliko odgovora, napačno pot, manjkajoč PDF in omrežno napako.
 
 `unhealthy` izvira iz ločenega healthchecka lokalnega `/health`. Sam po sebi ne pomeni, da je agentova anonimizacija odpovedala. Compose uporablja interval 20 s, timeout 20 s in zagonsko obdobje 45 s; s tem počasen zagon Python preverjanja ne odpove že po 5 s. Dejanski razlog neuspelega preverjanja preverite v healthcheck zgodovini Dockerja/Podmana. Pri namestitvi ohranite svoje porte, naslove API-jev in omrežne nastavitve.
+
+## Nastavitve iz ARM
+
+Storitev ob zagonu najprej uporabi priloženo knjižnico ArmUtils. V `.env` nastavite
+`ARM_APP_NAME` na pravo ime aplikacije v ARM (privzeto `anonymizer_service`) in
+`ARM_SETTINGS_URL` na URL vašega okolja. Klic pošlje `sfObjekt=ARM_APP_NAME`;
+`SF_NASTAVITEV` je ime obstoječe okoljske nastavitve, `SF_NASTAVITEV_VREDNOST` pa njena vrednost.
+Na primer, ARM ključ `AGENT_API_URL` nadomesti istoimensko vrednost iz okolja.
+V v6 veljajo enaka imena tudi za LLM tokene, podatkovno bazo, prijavo in druge aplikacijske nastavitve.
+
+ARM vrednosti imajo prednost pred okoljem. Ključi, ki jih ARM ne vrne, obdržijo
+okoljsko vrednost oziroma obstoječo privzeto vrednost aplikacije. Izrecno prazna
+ARM vrednost ostane prazna. Če klic ne uspe, vrne prazen seznam ali neveljaven
+seznam nastavitev, se uporabi okolje brez delnega uveljavljanja odgovora ARM.
+Vsebinsko neveljavne aplikacijske nastavitve (npr. neveljavna meja tokenov)
+še vedno zavrne obstoječa validacija; povezave z ARM to ne prikrijejo.
+
+Povezava z ARM se nastavi izključno prek okolja: `ARM_APP_NAME`,
+`ARM_SETTINGS_URL`, `ARM_TLS_VERIFY`, `ARM_CA_FILE`, `ARM_CA_PATH`,
+`ARM_CLIENT_CERT_FILE`, `ARM_CLIENT_KEY_FILE`, `ARM_CLIENT_KEY_PASSWORD`.
+Privzeto je preverjanje TLS vključeno. Za interno CA nastavite `ARM_CA_FILE`,
+za mTLS pa še datoteki certifikata in zasebnega ključa; datoteke morajo biti
+nameščene v vsebniku in poti nastavljene glede nanj. Bootstrap nastavitve morajo
+biti dostopne pred ARM klicem in jih ni mogoče pridobiti iz ARM za isti prvi klic.
+Privzeti URL knjižnice kaže na testni ARM; za produkcijo ga izrecno spremenite.
+
+ARM se prebere enkrat na proces (rok HTTP klica v knjižnici je 10 sekund).
+Za ponovno pridobitev, tudi po izpadu ARM, znova zaženite proces. Streamlit ob
+vsaki interakciji ne kliče ARM ponovno. Pri spremembi `.env` ponovno ustvarite
+vsebnik; `.env` pri neposrednem Python zagonu sami naložite v okolje.
+Nastavitve Dockerja/Podmana (objava portov, priklopi datotek, build, uporabnik
+vsebnika) ostajajo stvar konfiguracije namestitve in jih aplikacijski ARM ne spreminja.
+
+Knjižnica in dodatek za nalaganje okolja sta vključena v `vendor/armutils`, da je
+projekt samostojen. Odvisnosti namestite iz korena tega projekta z
+`pip install -r requirements.txt`;
+Dockerfile knjižnico namesti samodejno. Ob posodobitvi izvornega `armutils-main`
+osvežite tudi vključene kopije. Po teh spremembah je potreben nov build slike.
